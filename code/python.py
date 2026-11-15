@@ -98,7 +98,7 @@ except Exception:
 
 __id__ = "MaxTrace"
 __name__ = "MaxTrace"
-__version__ = "1.1.4"
+__version__ = "1.1.5"
 _CULPRIT_DETECTOR_SELF_MARKER = "CULPRIT_DETECTOR_SELF_MARKER_v1"
 __description__ = "MaxTrace — мощный детектор утечек, лагов и багов других плагинов (безопасная версия Culprit Detector [thx chestertech])"
 __author__ = "@itNotMax - @MaxExteraPlugins"

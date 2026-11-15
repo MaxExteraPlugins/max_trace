@@ -28,7 +28,7 @@
 ## 📥 Установка
 
 1. Перейдите во вкладку [**Releases**](https://github.com/MaxExteraPlugins/max_trace/releases/latest).
-2. Скачайте файл плагина `max_trace_v1.1.4.plugin`.
+2. Скачайте файл плагина `max_trace_v1.1.5.plugin`.
 3. Отправьте файл в Telegram (в «Избранное») или откройте его через проводник в exteraGram / AyuGram.
 4. Нажмите на сообщение с плагином и выберите **«Установить плагин»**.
 
