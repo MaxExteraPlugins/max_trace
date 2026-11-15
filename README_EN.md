@@ -21,7 +21,7 @@
 
 **MaxTrace** plugin for **exteraGram** and **AyuGram** clients.
 
-Powerful diagnostics and debugging tool for detecting memory leaks, lag, and plugin conflicts.
+Network request inspection and advanced client diagnostics.
 
 ---
 
