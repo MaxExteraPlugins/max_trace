@@ -5,3 +5,5 @@ bin/android.jar
 change_versions.bat
 __pycache__/
 *.pyc
+
+other-res/

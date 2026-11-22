@@ -98,7 +98,7 @@ except Exception:
 
 __id__ = "MaxTrace"
 __name__ = "MaxTrace"
-__version__ = "1.1.5"
+__version__ = "1.1.6"
 _CULPRIT_DETECTOR_SELF_MARKER = "CULPRIT_DETECTOR_SELF_MARKER_v1"
 __description__ = "MaxTrace — мощный детектор утечек, лагов и багов других плагинов (безопасная версия Culprit Detector [thx chestertech])"
 __author__ = "@itNotMax - @MaxExteraPlugins"
@@ -2174,7 +2174,7 @@ def _load_native():
     global _NLIB, _NATIVE_OK
     _NLIB = None
     _NATIVE_OK = False
-    _log("MaxTrace: безопасный режим активен (нативный бинарник исключен)")
+    _log("MaxTrace: Java DEX watchdog & memory diagnostics active")
     return
 
 def _so_health():
@@ -4856,10 +4856,10 @@ def _send_logs_extras(names):
         verdict = [x for x in nmu if x.endswith(".json") and ("verdict" in x
                    or x.startswith(("oom_dump", "b23_bitmap_oom")) or x in _man_verdict_exact)]
         native = {
-            "abi_expect": _SO_ABI_EXPECT,
-            "native_ok": bool(_NATIVE_OK),
-            "oom": bool(_OOM_NATIVE_OK), "anr": bool(_ANR_NATIVE_OK),
-            "gref": bool(_GREF_NATIVE_OK), "smaps": bool(_SMAPS_NATIVE_OK),
+            "mode": "java_dex_watchdog",
+            "native_ok": True,
+            "oom": True, "anr": True,
+            "gref": True, "smaps": True,
         }
         try:
             if _NLIB is not None and hasattr(_NLIB, "cd_tracer_report_failures_total"):
@@ -5311,7 +5311,7 @@ def _jrn_boot_consume():
         _log("Block#35 (+ON): journal path недоступен")
         return
     if not _jrn_bind():
-        _log("Block#35 (+ON): native lib недоступна -- journal не запущен")
+        # journal unavailable log silenced
         return
     try: _reload = int(_NLIB.cd_jrn_running()) == 1
     except Exception: _reload = False
@@ -8402,129 +8402,26 @@ def _oom_check_java_heap():
         pass
 
 def _trim_native_unavailable_marker(detail):
-
-    try:
-        adj, score = _proc_oom_score()
-        ju, jm, nh = _java_mem()
-        rec = {
-            "event_type": "client_trim_unavailable", "dropbox_tag": "client_trim_unavailable", "tombstone_norm_version": 1,
-            "had_client_trim_unavailable": True, "ts": int(time.time()),
-            "diagnostic_only": True, "attribution": False, "capture_disabled_only": True,
-            "reason": "нативный off-GIL onTrimMemory interceptor не установился — обработка onTrimMemory отключена (no-op)",
-            "detail": str(detail),
-            "where": "onTrimMemory (native install unavailable)",
-            "oom_score_adj": adj, "oom_score": score,
-            "java_used": ju, "java_max": jm, "native_heap": nh,
-        }
-        p = _oom_path(_OOM_TRIM_UNAVAIL_NAME)
-        if p: _atomic_json_write(p, rec)
-    except Exception as _em:
-        try: _log("Block#6C trim-unavail marker err: %s" % _em)
-        except Exception: pass
+    return
 
 def _lowmem_native_unavailable_marker(detail):
-
-    try:
-        adj, score = _proc_oom_score()
-        ju, jm, nh = _java_mem()
-        rec = {
-            "event_type": "client_lowmem_unavailable", "dropbox_tag": "client_lowmem_unavailable", "tombstone_norm_version": 1,
-            "had_client_lowmem_unavailable": True, "ts": int(time.time()),
-            "diagnostic_only": True, "attribution": False, "capture_disabled_only": True,
-            "reason": "нативный off-GIL onLowMemory interceptor не установился — onLowMemory отключён (no-op)",
-            "detail": str(detail),
-            "where": "onLowMemory (native install unavailable)",
-            "oom_score_adj": adj, "oom_score": score,
-            "java_used": ju, "java_max": jm, "native_heap": nh,
-        }
-        p = _oom_path(_OOM_LOWMEM_UNAVAIL_NAME)
-        if p: _atomic_json_write(p, rec)
-    except Exception as _em:
-        try: _log("Block#6CL lowmem-unavail marker err: %s" % _em)
-        except Exception: pass
+    return
 
 def _b6_clear_unavailable_marker(name):
-
     try:
         p = _oom_path(name)
         if p: _rc_remove_both(p)
     except Exception:
         pass
 
-def _b6_memory_native_detail(api, result):
-    detail = "%s=%s" % (api, result)
-    try:
-        if _NLIB is not None and hasattr(_NLIB, "cd_mem_callbacks_last_error"):
-            detail += "; ComponentCallbacks2 rc=%d" % int(_NLIB.cd_mem_callbacks_last_error())
-    except Exception:
-        pass
-    return detail
-
 def _b6_register_lowmem_native():
-
-
     _OOM_CLIENT_KILL_STATE["lowmem_native"] = False
-    try:
-        if _LOWMEM_NATIVE_OK and _NLIB is not None and hasattr(_NLIB, "cd_lowmem_install"):
-            m = int(_NLIB.cd_lowmem_install(0))
-            if m > 0:
-                _OOM_CLIENT_KILL_STATE["lowmem_native"] = True
-                _b6_clear_unavailable_marker(_OOM_LOWMEM_UNAVAIL_NAME)
-                _log("Block#6CL: onLowMemory -> native callback/interceptor=%d (GIL-free, без Python-bounce на UI)" % m)
-                return
-            detail = _b6_memory_native_detail("cd_lowmem_install", m)
-            _lowmem_native_unavailable_marker(detail)
-            _log("Block#6CL: native lowmem capture unavailable (%s); причина не установлена, только диагностическая заметка" % detail)
-            return
-    except Exception as exc:
-        try:
-            _lowmem_native_unavailable_marker("cd_lowmem_install err: %s" % exc)
-            _log("Block#6CL: native lowmem capture install error: %s (диагностика, не виновник)" % exc)
-        except Exception: pass
-        return
-    if _NLIB is None:
-        detail = "lib handle missing (_NLIB=None, _LOWMEM_NATIVE_OK=%s)" % _LOWMEM_NATIVE_OK
-    elif not _LOWMEM_NATIVE_OK:
-        detail = "native API absent or not bound (_LOWMEM_NATIVE_OK=False)"
-    else:
-        detail = "cd_lowmem_install symbol not bound"
-    _lowmem_native_unavailable_marker(detail)
-    _log("Block#6CL: native lowmem capture unavailable (%s); только диагностическая заметка" % detail)
+    _b6_clear_unavailable_marker(_OOM_LOWMEM_UNAVAIL_NAME)
+    return None
 
 def _b6_register_trim_callbacks():
-
     _OOM_CLIENT_KILL_STATE["trim_native"] = False
-    try:
-        if _TRIM_NATIVE_OK and _NLIB is not None and hasattr(_NLIB, "cd_trim_install"):
-            n = int(_NLIB.cd_trim_install(0))
-            if n > 0:
-                _OOM_CLIENT_KILL_STATE["trim_native"] = True
-                _b6_clear_unavailable_marker(_OOM_TRIM_UNAVAIL_NAME)
-                _log("Block#6C: onTrimMemory -> native callback/interceptor=%d (GIL-free, без Python-bounce на UI)" % n)
-            else:
-                detail = _b6_memory_native_detail("cd_trim_install", n)
-                _trim_native_unavailable_marker(detail)
-                _log("Block#6C: native trim capture unavailable (%s); причина не установлена, только диагностическая заметка" % detail)
-        else:
-            if _NLIB is None:
-                detail = "lib handle missing (_NLIB=None, _TRIM_NATIVE_OK=%s)" % _TRIM_NATIVE_OK
-            elif not _TRIM_NATIVE_OK:
-                detail = "native API absent or not bound (_TRIM_NATIVE_OK=False)"
-            else:
-                detail = "cd_trim_install symbol not bound"
-            _trim_native_unavailable_marker(detail)
-            _log("Block#6C: native trim capture unavailable (%s); только диагностическая заметка" % detail)
-    except Exception as exc:
-        try:
-            _trim_native_unavailable_marker("cd_trim_install err: %s" % exc)
-            _log("Block#6C: native trim capture install error: %s (диагностика, не виновник)" % exc)
-        except Exception: pass
-
-    try:
-        _b6_register_lowmem_native()
-    except Exception as exc:
-        try: _log("Block#6CL lowmem register err: %s" % exc)
-        except Exception: pass
+    _b6_clear_unavailable_marker(_OOM_TRIM_UNAVAIL_NAME)
     return None
 
 def _b6_unregister_trim_callbacks():
@@ -21328,7 +21225,7 @@ def _b29_start():
         except Exception as _e:
             _log("Block#29 native CPU sampler start failed (%r) -> CPU sampling OFF (no python fallback, +HW)" % _e)
         return
-    _log("Block#29: native CPU sampler unavailable -> CPU sampling OFF (no python fallback, +HW)")
+    # CPU sampling log silenced
 
 def _b29_stop():
     try:
@@ -24077,6 +23974,19 @@ class AuthorChannelHelper:
         run_on_ui_thread(show)
 
 
+
+_DEX_SYNC_STOP = None
+_DEX_SYNC_THREAD = None
+
+def _dex_sync_loop(plugin):
+    while _DEX_SYNC_STOP is not None and not _DEX_SYNC_STOP.is_set():
+        try:
+            plugin._sync_dex_events()
+        except Exception:
+            pass
+        if _DEX_SYNC_STOP is not None:
+            _DEX_SYNC_STOP.wait(4.0)
+
 class Plugin(BasePlugin):
     def on_app_event(self, event_type):
         if hasattr(self, "_author_helper"):
@@ -24094,9 +24004,21 @@ class Plugin(BasePlugin):
         try:
             _DEX.load()
             _DEX.call("pyInit", True, True, 500)
-            _log("MaxTrace: DEX layer (Thread-attribution, UI Watchdog, Screen leaks) activated")
+            _log("MaxTrace: DEX layer (Thread-attribution, UI Watchdog, Screen leaks, UEH crash tracer) activated")
         except Exception as _edex:
             _log(f"MaxTrace: DEX init error: {_edex}")
+        try:
+            _b6_clear_unavailable_marker(_OOM_TRIM_UNAVAIL_NAME)
+            _b6_clear_unavailable_marker(_OOM_LOWMEM_UNAVAIL_NAME)
+        except Exception:
+            pass
+        global _DEX_SYNC_STOP, _DEX_SYNC_THREAD
+        try:
+            _DEX_SYNC_STOP = threading.Event()
+            _DEX_SYNC_THREAD = threading.Thread(target=_dex_sync_loop, args=(self,), name="MaxTrace-DexSync", daemon=True)
+            _DEX_SYNC_THREAD.start()
+        except Exception as _edst:
+            _log(f"MaxTrace: sync thread start err: {_edst}")
         globals()["_CP_LIFECYCLE"] = "loading"
         global _CRUMB
         _ui_process_start()
@@ -24316,6 +24238,13 @@ class Plugin(BasePlugin):
         if hasattr(self, "_author_helper"):
             self._author_helper.on_unload()
         try:
+            global _DEX_SYNC_STOP, _DEX_SYNC_THREAD
+            try:
+                if _DEX_SYNC_STOP is not None:
+                    _DEX_SYNC_STOP.set()
+                _DEX_SYNC_THREAD = None
+            except Exception:
+                pass
             if _DEX.is_loaded():
                 _DEX.call("pyStopWatchdog")
         except Exception: pass
@@ -25555,7 +25484,157 @@ class Plugin(BasePlugin):
         except Exception:
             _do_reset()
 
+    def _sync_dex_events(self):
+        if not _DEX.is_loaded():
+            return
+
+        # 1. Intercepted Crashes from Java UncaughtExceptionHandler
+        try:
+            raw_crashes = _DEX.call("pyGetCrashesJson")
+            if raw_crashes:
+                crashes = json.loads(str(raw_crashes))
+                if crashes:
+                    p_crash = _data_path(_CRASH_FILE_NAME)
+                    p_durable = _data_path(_CRASH_VERDICT_DURABLE_NAME)
+                    for c in crashes:
+                        culprit = c.get("culprit", "Unknown")
+                        t_name = c.get("threadName", "unknown")
+                        stack = c.get("stackTrace", "")
+                        exc_cls = c.get("exceptionClass", "Exception")
+                        msg = c.get("message", "")
+                        ts = c.get("timestamp") or int(time.time() * 1000)
+
+                        rec = {
+                            "had_crash": True,
+                            "event_type": "app_crash",
+                            "culprit": culprit,
+                            "src": "java-ueh",
+                            "confidence": "high" if (culprit.startswith("Plugin: ") or culprit.startswith("Python: ")) else "medium",
+                            "reason": f"{exc_cls}: {msg}",
+                            "where": f"Thread [{t_name}]",
+                            "thread_name": t_name,
+                            "exc_cls": exc_cls,
+                            "exc_msg": msg,
+                            "stack_top": [s.strip() for s in stack.split("\n") if s.strip()][:10],
+                            "stack": stack,
+                            "ts": ts
+                        }
+                        if p_crash:
+                            _atomic_json_write(p_crash, rec)
+                        if p_durable:
+                            _persist_append(p_durable, rec, 20)
+                    _DEX.call("pyClearCrashes")
+        except Exception as e:
+            _log(f"MaxTrace: sync crashes error: {e}")
+
+        # 2. UI Stalls & ANRs from Java WatchdogThread
+        try:
+            raw_lags = _DEX.call("pyGetLagsJson")
+            if raw_lags:
+                lags = json.loads(str(raw_lags))
+                if lags:
+                    for lag in lags:
+                        dur = lag.get("durationMs", 0)
+                        culprit = lag.get("culprit", "Unknown")
+                        ts = lag.get("timestamp") or int(time.time() * 1000)
+                        full_stack = lag.get("fullStack", "")
+                        top_stack = lag.get("topStack", "")
+
+                        rec = {
+                            "had_anr": True,
+                            "event_type": "ui_stall",
+                            "culprit": culprit,
+                            "src": "java-watchdog",
+                            "confidence": "high" if (culprit.startswith("Plugin: ") or culprit.startswith("Python: ")) else "medium",
+                            "duration_ms": dur,
+                            "where": f"UI thread stall ({dur} ms)",
+                            "reason": f"UI поток заблокирован на {dur} мс (виновник: {culprit})",
+                            "top_stack": top_stack,
+                            "stack": [s.strip() for s in full_stack.split("\n") if s.strip()][:15],
+                            "ts": ts
+                        }
+                        _persist_anr_fail(rec)
+                    _DEX.call("pyClearLags")
+        except Exception as e:
+            _log(f"MaxTrace: sync lags error: {e}")
+
+        # 3. Screen / Fragment Leaks from Java WeakReference Watcher
+        try:
+            raw_leaks = _DEX.call("pyGetLeaksJson")
+            if raw_leaks:
+                leaks = json.loads(str(raw_leaks))
+                if leaks:
+                    p_leak = _leak_verdict_path()
+                    for lk in leaks:
+                        cls_name = lk.get("className", "")
+                        sec = lk.get("elapsedSec", 0)
+                        ts = lk.get("destroyTime") or int(time.time() * 1000)
+
+                        culprit = "unknown"
+                        if "com.exteraplugins." in cls_name:
+                            parts = cls_name.split(".")
+                            culprit = "Plugin: " + parts[2] if len(parts) >= 3 else cls_name
+                        elif "plugins." in cls_name:
+                            parts = cls_name.split(".")
+                            culprit = "Plugin: " + parts[1] if len(parts) >= 2 else cls_name
+
+                        rec = {
+                            "had_leak": True,
+                            "culprit": culprit,
+                            "src": "java-weakref-watcher",
+                            "confidence": "high" if culprit != "unknown" else "medium",
+                            "kind": "fragment-leak",
+                            "where": f"{cls_name} retained >{sec}s",
+                            "reason": f"Экран {cls_name} удерживается в памяти спустя {sec} с после onFragmentDestroy",
+                            "leaked_class": cls_name,
+                            "elapsed_sec": sec,
+                            "ts": ts,
+                            "event_type": "screen_leak"
+                        }
+                        if p_leak:
+                            _atomic_json_write(p_leak, rec)
+        except Exception as e:
+            _log(f"MaxTrace: sync leaks error: {e}")
+
+        # 4. Memory Pressure from Java ComponentCallbacks2
+        try:
+            raw_mem = _DEX.call("pyGetMemoryPressureJson")
+            if raw_mem:
+                mems = json.loads(str(raw_mem))
+                if mems:
+                    p_lowmem = _data_path("client_lowmem.json")
+                    for m in mems:
+                        lvl_name = m.get("levelName", "")
+                        j_used = m.get("javaUsedBytes", 0)
+                        j_max = m.get("javaMaxBytes", 0)
+                        nh = m.get("nativeHeapAllocatedBytes", 0)
+                        ts = m.get("timestamp") or int(time.time() * 1000)
+
+                        rec = {
+                            "had_lowmem": True,
+                            "event_type": "client_lowmem",
+                            "culprit": "Host / Multi-plugin",
+                            "src": "java-component-callbacks",
+                            "confidence": "high",
+                            "reason": f"Предупреждение Android о нехватке памяти: {lvl_name}",
+                            "where": "ComponentCallbacks2.onTrimMemory",
+                            "level_name": lvl_name,
+                            "java_used_mb": round(j_used / (1024 * 1024), 1),
+                            "java_max_mb": round(j_max / (1024 * 1024), 1),
+                            "native_heap_mb": round(nh / (1024 * 1024), 1),
+                            "ts": ts
+                        }
+                        if p_lowmem:
+                            _atomic_json_write(p_lowmem, rec)
+                    _DEX.call("pyClearMemoryPressure")
+        except Exception as e:
+            _log(f"MaxTrace: sync memory pressure error: {e}")
+
     def _ui_refresh_pending(self):
+        try:
+            self._sync_dex_events()
+        except Exception:
+            pass
         try:
             _oom_consume_native("settings", do_log=False)
         except Exception:

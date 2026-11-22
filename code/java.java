@@ -1,5 +1,9 @@
 package com.exteraplugins.MaxTrace;
 
+import android.content.ComponentCallbacks2;
+import android.content.Context;
+import android.content.res.Configuration;
+import android.os.Debug;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
@@ -19,8 +23,8 @@ import de.robv.android.xposed.XposedBridge;
 
 public class Main {
     public static final String TAG = "MaxTrace";
-    public static final String VERSION = "1.1.2";
-    public static final int VERSION_CODE = 10;
+    public static final String VERSION = "1.1.6";
+    public static final int VERSION_CODE = 13;
 
     private static volatile boolean sTrackScreens = true;
     private static volatile boolean sTrackLags = true;
@@ -32,7 +36,14 @@ public class Main {
     private static final List<LagRecord> sLagRecords = Collections.synchronizedList(new ArrayList<LagRecord>());
     private static final int MAX_LAG_RECORDS = 50;
 
-    // Thread ID -> Plugin ID attribution registry (replaces removed native Block#3E)
+    private static final List<CrashRecord> sCrashRecords = Collections.synchronizedList(new ArrayList<CrashRecord>());
+    private static final int MAX_CRASH_RECORDS = 30;
+    private static Thread.UncaughtExceptionHandler sPreviousUEH = null;
+
+    private static final List<MemoryPressureRecord> sMemoryPressureRecords = Collections.synchronizedList(new ArrayList<MemoryPressureRecord>());
+    private static final int MAX_MEMORY_PRESSURE_RECORDS = 20;
+
+    // Thread ID -> Plugin ID attribution registry
     private static final Map<Long, String> sThreadOwners = new ConcurrentHashMap<Long, String>();
 
     // Plugin ID -> Active NotificationCenter Observers count
@@ -63,6 +74,42 @@ public class Main {
             this.culprit = culprit;
             this.topStack = topStack;
             this.fullStack = fullStack;
+        }
+    }
+
+    public static class CrashRecord {
+        public final long timestamp;
+        public final String threadName;
+        public final String culprit;
+        public final String exceptionClass;
+        public final String message;
+        public final String stackTrace;
+
+        public CrashRecord(long timestamp, String threadName, String culprit, String exceptionClass, String message, String stackTrace) {
+            this.timestamp = timestamp;
+            this.threadName = threadName;
+            this.culprit = culprit;
+            this.exceptionClass = exceptionClass;
+            this.message = message;
+            this.stackTrace = stackTrace;
+        }
+    }
+
+    public static class MemoryPressureRecord {
+        public final long timestamp;
+        public final int level;
+        public final long javaUsedBytes;
+        public final long javaMaxBytes;
+        public final long nativeHeapAllocatedBytes;
+        public final String levelName;
+
+        public MemoryPressureRecord(long timestamp, int level, long javaUsedBytes, long javaMaxBytes, long nativeHeapAllocatedBytes, String levelName) {
+            this.timestamp = timestamp;
+            this.level = level;
+            this.javaUsedBytes = javaUsedBytes;
+            this.javaMaxBytes = javaMaxBytes;
+            this.nativeHeapAllocatedBytes = nativeHeapAllocatedBytes;
+            this.levelName = levelName;
         }
     }
 
@@ -119,7 +166,7 @@ public class Main {
                     String culprit = detectCulprit(stack);
                     String topStack = stack.length > 0 ? stack[0].toString() : "empty";
                     StringBuilder sb = new StringBuilder();
-                    int maxLines = Math.min(stack.length, 25);
+                    int maxLines = Math.min(stack.length, 30);
                     for (int i = 0; i < maxLines; i++) {
                         sb.append(stack[i].toString()).append("\n");
                     }
@@ -135,7 +182,7 @@ public class Main {
                     long totalDuration = System.currentTimeMillis() - stallStart;
                     if (totalDuration >= threshold) {
                         addLagRecord(new LagRecord(stallStart, totalDuration, culprit, topStack, sb.toString()));
-                        Log.w(TAG, "UI Stall: " + totalDuration + "ms, culprit: " + culprit);
+                        Log.w(TAG, "UI Stall detected: " + totalDuration + "ms, culprit: " + culprit);
                     }
                 }
             }
@@ -148,25 +195,59 @@ public class Main {
             String cls = elem.getClassName();
             if (cls.startsWith("com.exteraplugins.")) {
                 String[] parts = cls.split("\\.");
-                if (parts.length >= 3) {
-                    return "Plugin: " + parts[2];
+                return parts.length >= 3 ? "Plugin: " + parts[2] : "Plugin: " + cls;
+            }
+            if (cls.startsWith("com.ayugram.plugins.")) {
+                String[] parts = cls.split("\\.");
+                return parts.length >= 4 ? "Plugin: " + parts[3] : "Plugin: " + cls;
+            }
+            if (cls.startsWith("plugins.")) {
+                String[] parts = cls.split("\\.");
+                return parts.length >= 2 ? "Plugin: " + parts[1] : "Plugin: " + cls;
+            }
+            if (cls.startsWith("com.exteragram.plugins.")) {
+                String[] parts = cls.split("\\.");
+                return parts.length >= 4 ? "Plugin: " + parts[3] : "Plugin: " + cls;
+            }
+            String file = elem.getFileName();
+            if (file != null && file.endsWith(".py")) {
+                String base = file;
+                if (base.contains("/")) base = base.substring(base.lastIndexOf('/') + 1);
+                if (base.contains("\\")) base = base.substring(base.lastIndexOf('\\') + 1);
+                if (!base.equals("python.py") && !base.equals("base_plugin.py")) {
+                    return "Python: " + (base.endsWith(".py") ? base.substring(0, base.length() - 3) : base);
                 }
-                return "Plugin: " + cls;
             }
             if (cls.contains("chaquo") || cls.contains("python")) {
                 return "Python Plugin Hook (" + elem.getMethodName() + ")";
             }
             if (cls.contains("xposed") || cls.contains("XposedBridge")) {
-                return "Xposed Hook";
+                return "Xposed Hook: " + elem.getMethodName();
             }
             if (cls.contains("SQLite") || cls.contains("database")) {
                 return "Database I/O on UI thread";
+            }
+            if (cls.contains("FinalizerDaemon") || cls.contains("ReferenceQueueDaemon")) {
+                return "GC / Finalizer daemon";
             }
         }
         if (stack.length > 0) {
             return "Host UI: " + stack[0].getClassName() + "." + stack[0].getMethodName();
         }
         return "Unknown";
+    }
+
+    public static String detectCulpritFromThrowable(Throwable t) {
+        if (t == null) return "Unknown";
+        Throwable cur = t;
+        while (cur != null) {
+            String cul = detectCulprit(cur.getStackTrace());
+            if (cul != null && !cul.equals("Unknown") && !cul.startsWith("Host UI")) {
+                return cul;
+            }
+            cur = cur.getCause();
+        }
+        return detectCulprit(t.getStackTrace());
     }
 
     private static void addLagRecord(LagRecord record) {
@@ -176,39 +257,6 @@ public class Main {
             }
             sLagRecords.add(record);
         }
-    }
-
-    public static synchronized void pyInit(boolean trackScreens, boolean trackLags, int lagThresholdMs) {
-        sTrackScreens = trackScreens;
-        sTrackLags = trackLags;
-        sLagThresholdMs = lagThresholdMs;
-
-        if (sInitialized) {
-            return;
-        }
-        sInitialized = true;
-
-        hookBaseFragment();
-        hookThreadStart();
-        hookNotificationCenter();
-        startWatchdog();
-
-        Log.i(TAG, "MaxTrace Java-layer loaded: trackScreens=" + sTrackScreens + ", trackLags=" + sTrackLags);
-    }
-
-    public static synchronized void pyUpdateSettings(boolean trackScreens, boolean trackLags, int lagThresholdMs) {
-        sTrackScreens = trackScreens;
-        sTrackLags = trackLags;
-        sLagThresholdMs = lagThresholdMs;
-    }
-
-    public static synchronized void pyStopWatchdog() {
-        if (sWatchdog != null) {
-            sWatchdog.stopWatchdog();
-            sWatchdog = null;
-        }
-        sInitialized = false;
-        Log.i(TAG, "MaxTrace stopped");
     }
 
     private static void hookBaseFragment() {
@@ -302,11 +350,132 @@ public class Main {
         }
     }
 
+    private static void installUncaughtExceptionHandler() {
+        try {
+            Thread.UncaughtExceptionHandler defaultHandler = Thread.getDefaultUncaughtExceptionHandler();
+            if (defaultHandler != null && defaultHandler.getClass().getName().contains("MaxTrace")) {
+                return;
+            }
+            sPreviousUEH = defaultHandler;
+            Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
+                @Override
+                public void uncaughtException(Thread thread, Throwable throwable) {
+                    try {
+                        String culprit = detectCulpritFromThrowable(throwable);
+                        String stackStr = Log.getStackTraceString(throwable);
+                        String excCls = throwable != null ? throwable.getClass().getName() : "UnknownException";
+                        String msg = throwable != null ? String.valueOf(throwable.getMessage()) : "";
+                        String tName = thread != null ? thread.getName() : "unknown-thread";
+
+                        synchronized (sCrashRecords) {
+                            if (sCrashRecords.size() >= MAX_CRASH_RECORDS) {
+                                sCrashRecords.remove(0);
+                            }
+                            sCrashRecords.add(new CrashRecord(System.currentTimeMillis(), tName, culprit, excCls, msg, stackStr));
+                        }
+                        Log.e(TAG, "MaxTrace intercepted crash in thread [" + tName + "] attributed to: " + culprit);
+                    } catch (Throwable ignored) {
+                    }
+                    if (sPreviousUEH != null) {
+                        sPreviousUEH.uncaughtException(thread, throwable);
+                    }
+                }
+            });
+            Log.d(TAG, "Installed MaxTrace Java UncaughtExceptionHandler");
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed to install UncaughtExceptionHandler", t);
+        }
+    }
+
+    public static void registerComponentCallbacks(Context context) {
+        if (context == null) return;
+        try {
+            context.getApplicationContext().registerComponentCallbacks(new ComponentCallbacks2() {
+                @Override
+                public void onTrimMemory(int level) {
+                    long now = System.currentTimeMillis();
+                    Runtime rt = Runtime.getRuntime();
+                    long javaUsed = rt.totalMemory() - rt.freeMemory();
+                    long javaMax = rt.maxMemory();
+                    long nativeHeap = Debug.getNativeHeapAllocatedSize();
+
+                    String lvlName = "TRIM_LEVEL_" + level;
+                    if (level == TRIM_MEMORY_COMPLETE) lvlName = "TRIM_COMPLETE";
+                    else if (level == TRIM_MEMORY_MODERATE) lvlName = "TRIM_MODERATE";
+                    else if (level == TRIM_MEMORY_RUNNING_CRITICAL) lvlName = "TRIM_RUNNING_CRITICAL";
+                    else if (level == TRIM_MEMORY_RUNNING_LOW) lvlName = "TRIM_RUNNING_LOW";
+                    else if (level == TRIM_MEMORY_UI_HIDDEN) lvlName = "TRIM_UI_HIDDEN";
+
+                    synchronized (sMemoryPressureRecords) {
+                        if (sMemoryPressureRecords.size() >= MAX_MEMORY_PRESSURE_RECORDS) {
+                            sMemoryPressureRecords.remove(0);
+                        }
+                        sMemoryPressureRecords.add(new MemoryPressureRecord(now, level, javaUsed, javaMax, nativeHeap, lvlName));
+                    }
+                    Log.w(TAG, "Memory pressure trimmed: " + lvlName + ", javaUsed=" + (javaUsed / 1048576) + "MB");
+                }
+
+                @Override
+                public void onConfigurationChanged(Configuration newConfig) {
+                }
+
+                @Override
+                public void onLowMemory() {
+                    onTrimMemory(TRIM_MEMORY_COMPLETE);
+                }
+            });
+            Log.d(TAG, "ComponentCallbacks2 registered successfully");
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed to register ComponentCallbacks2", t);
+        }
+    }
+
     private static void startWatchdog() {
         if (sWatchdog == null || !sWatchdog.isAlive()) {
             sWatchdog = new WatchdogThread();
             sWatchdog.start();
         }
+    }
+
+    public static synchronized void pyInit(boolean trackScreens, boolean trackLags, int lagThresholdMs) {
+        sTrackScreens = trackScreens;
+        sTrackLags = trackLags;
+        sLagThresholdMs = lagThresholdMs;
+
+        if (sInitialized) {
+            return;
+        }
+        sInitialized = true;
+
+        hookBaseFragment();
+        hookThreadStart();
+        hookNotificationCenter();
+        installUncaughtExceptionHandler();
+        startWatchdog();
+
+        try {
+            Class<?> appLoader = Class.forName("org.telegram.messenger.ApplicationLoader");
+            Context ctx = (Context) appLoader.getField("applicationContext").get(null);
+            registerComponentCallbacks(ctx);
+        } catch (Throwable ignored) {
+        }
+
+        Log.i(TAG, "MaxTrace Java-layer loaded: trackScreens=" + sTrackScreens + ", trackLags=" + sTrackLags);
+    }
+
+    public static synchronized void pyUpdateSettings(boolean trackScreens, boolean trackLags, int lagThresholdMs) {
+        sTrackScreens = trackScreens;
+        sTrackLags = trackLags;
+        sLagThresholdMs = lagThresholdMs;
+    }
+
+    public static synchronized void pyStopWatchdog() {
+        if (sWatchdog != null) {
+            sWatchdog.stopWatchdog();
+            sWatchdog = null;
+        }
+        sInitialized = false;
+        Log.i(TAG, "MaxTrace stopped");
     }
 
     public static String pyGetThreadOwner(long tid) {
@@ -405,6 +574,60 @@ public class Main {
         return sb.toString();
     }
 
+    public static String pyGetCrashesJson() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("[");
+        boolean first = true;
+
+        synchronized (sCrashRecords) {
+            for (CrashRecord c : sCrashRecords) {
+                if (!first) sb.append(",");
+                first = false;
+                sb.append("{");
+                sb.append("\"timestamp\":").append(c.timestamp).append(",");
+                sb.append("\"threadName\":\"").append(escapeJson(c.threadName)).append("\",");
+                sb.append("\"culprit\":\"").append(escapeJson(c.culprit)).append("\",");
+                sb.append("\"exceptionClass\":\"").append(escapeJson(c.exceptionClass)).append("\",");
+                sb.append("\"message\":\"").append(escapeJson(c.message)).append("\",");
+                sb.append("\"stackTrace\":\"").append(escapeJson(c.stackTrace)).append("\"");
+                sb.append("}");
+            }
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    public static String pyGetMemoryPressureJson() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("[");
+        boolean first = true;
+
+        synchronized (sMemoryPressureRecords) {
+            for (MemoryPressureRecord m : sMemoryPressureRecords) {
+                if (!first) sb.append(",");
+                first = false;
+                sb.append("{");
+                sb.append("\"timestamp\":").append(m.timestamp).append(",");
+                sb.append("\"level\":").append(m.level).append(",");
+                sb.append("\"levelName\":\"").append(escapeJson(m.levelName)).append("\",");
+                sb.append("\"javaUsedBytes\":").append(m.javaUsedBytes).append(",");
+                sb.append("\"javaMaxBytes\":").append(m.javaMaxBytes).append(",");
+                sb.append("\"nativeHeapAllocatedBytes\":").append(m.nativeHeapAllocatedBytes);
+                sb.append("}");
+            }
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    public static void pyClearCrashes() {
+        sCrashRecords.clear();
+    }
+
+    public static void pyClearMemoryPressure() {
+        sMemoryPressureRecords.clear();
+    }
+
     public static void pyClearLags() {
         sLagRecords.clear();
     }
@@ -427,11 +650,16 @@ public class Main {
         synchronized (sLagRecords) {
             lagsCount = sLagRecords.size();
         }
+        int crashesCount;
+        synchronized (sCrashRecords) {
+            crashesCount = sCrashRecords.size();
+        }
 
         StringBuilder sb = new StringBuilder();
         sb.append("{");
         sb.append("\"leaksCount\":").append(leaksCount).append(",");
         sb.append("\"lagsCount\":").append(lagsCount).append(",");
+        sb.append("\"crashesCount\":").append(crashesCount).append(",");
         sb.append("\"trackedScreensCount\":").append(sTrackedFragments.size()).append(",");
         sb.append("\"trackedThreadsCount\":").append(sThreadOwners.size());
         sb.append("}");
