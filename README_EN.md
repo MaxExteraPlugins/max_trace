@@ -21,14 +21,14 @@
 
 **MaxTrace** plugin for **exteraGram** and **AyuGram** clients.
 
-MaxTrace — advanced detector for memory leaks, lag, and bugs in other plugins.
+MaxTrace is a powerful leak, lag, and bug detector for other plugins (safe version of Culprit Detector).
 
 ---
 
 ## 📥 Installation
 
 1. Navigate to the [**Releases**](https://github.com/MaxExteraPlugins/max_trace/releases/latest) section.
-2. Download the `max_trace_v1.1.6.plugin` file.
+2. Download the `max_trace_v1.1.7.plugin` file.
 3. Send the file to your Telegram Saved Messages or open it via file manager in exteraGram / AyuGram.
 4. Tap the file in Telegram and choose **"Install plugin"**.
 

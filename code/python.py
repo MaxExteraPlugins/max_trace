@@ -98,7 +98,7 @@ except Exception:
 
 __id__ = "MaxTrace"
 __name__ = "MaxTrace"
-__version__ = "1.1.6"
+__version__ = "1.1.7"
 _CULPRIT_DETECTOR_SELF_MARKER = "CULPRIT_DETECTOR_SELF_MARKER_v1"
 __description__ = "MaxTrace — мощный детектор утечек, лагов и багов других плагинов (безопасная версия Culprit Detector [thx chestertech])"
 __author__ = "@itNotMax - @MaxExteraPlugins"
@@ -16981,10 +16981,6 @@ def _wrap_settings_factory(pid, fn):
             if pushed: _scoped_clear()
         try: _wrap_ui_callbacks(pid, items)
         except Exception: pass
-        if hasattr(self, "_author_helper"):
-
-            return self._author_helper.prepend_settings(items)
-
         return items
     try: setattr(_w, _B_TAGGED_FLAG, True)
     except Exception: pass
