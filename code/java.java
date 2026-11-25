@@ -9,9 +9,11 @@ import android.os.Looper;
 import android.util.Log;
 
 import java.lang.ref.WeakReference;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -23,8 +25,8 @@ import de.robv.android.xposed.XposedBridge;
 
 public class Main {
     public static final String TAG = "MaxTrace";
-    public static final String VERSION = "1.1.6";
-    public static final int VERSION_CODE = 13;
+    public static final String VERSION = "1.1.9";
+    public static final int VERSION_CODE = 15;
 
     private static volatile boolean sTrackScreens = true;
     private static volatile boolean sTrackLags = true;
@@ -46,8 +48,24 @@ public class Main {
     // Thread ID -> Plugin ID attribution registry
     private static final Map<Long, String> sThreadOwners = new ConcurrentHashMap<Long, String>();
 
-    // Plugin ID -> Active NotificationCenter Observers count
+    // NotificationCenter Event ID -> Event Name mapping (built dynamically from NotificationCenter static fields)
+    private static final Map<Integer, String> sEventNames = new ConcurrentHashMap<Integer, String>();
+    // Plugin ID -> (Event Name -> Count)
+    private static final Map<String, Map<String, Integer>> sPluginObserverDetails = new ConcurrentHashMap<String, Map<String, Integer>>();
+    // Plugin ID -> Total Observer Count
     private static final Map<String, Integer> sObserverCounts = new ConcurrentHashMap<String, Integer>();
+
+    // Plugin ID -> Network Request Stats (total, inLastMinute, lastRequestType, lastRequestTimestamp)
+    public static class NetworkPluginStats {
+        public int totalRequests = 0;
+        public final List<Long> requestTimestamps = new ArrayList<Long>();
+        public String lastRequestType = "none";
+        public long lastRequestTime = 0;
+    }
+    private static final Map<String, NetworkPluginStats> sNetworkStats = new ConcurrentHashMap<String, NetworkPluginStats>();
+
+    // Known Plugin ID -> Plugin Name cache
+    private static final Map<String, String> sKnownPlugins = new ConcurrentHashMap<String, String>();
 
     public static class TrackedFragment {
         public final WeakReference<Object> ref;
@@ -189,25 +207,62 @@ public class Main {
         }
     }
 
+    public static void updateKnownPlugins() {
+        try {
+            Class<?> pcCls = Class.forName("com.exteragram.messenger.plugins.PluginsController");
+            Object companion = pcCls.getField("Companion").get(null);
+            Method getInstanceMethod = companion.getClass().getMethod("getInstance");
+            Object instance = getInstanceMethod.invoke(companion);
+            if (instance != null) {
+                Method getPluginsMethod = instance.getClass().getMethod("getPlugins");
+                Map<?, ?> plugins = (Map<?, ?>) getPluginsMethod.invoke(instance);
+                if (plugins != null) {
+                    for (Map.Entry<?, ?> entry : plugins.entrySet()) {
+                        String id = String.valueOf(entry.getKey());
+                        Object pObj = entry.getValue();
+                        if (pObj != null) {
+                            try {
+                                Method getNameMethod = pObj.getClass().getMethod("getName");
+                                String name = (String) getNameMethod.invoke(pObj);
+                                sKnownPlugins.put(id, name != null ? name : id);
+                            } catch (Throwable ignored) {
+                                sKnownPlugins.put(id, id);
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     public static String detectCulprit(StackTraceElement[] stack) {
         if (stack == null) return "Unknown";
         for (StackTraceElement elem : stack) {
             String cls = elem.getClassName();
             if (cls.startsWith("com.exteraplugins.")) {
                 String[] parts = cls.split("\\.");
-                return parts.length >= 3 ? "Plugin: " + parts[2] : "Plugin: " + cls;
+                String pId = parts.length >= 3 ? parts[2] : cls;
+                String pName = sKnownPlugins.get(pId);
+                return pName != null ? "Plugin: " + pName + " (" + pId + ")" : "Plugin: " + pId;
             }
             if (cls.startsWith("com.ayugram.plugins.")) {
                 String[] parts = cls.split("\\.");
-                return parts.length >= 4 ? "Plugin: " + parts[3] : "Plugin: " + cls;
+                String pId = parts.length >= 4 ? parts[3] : cls;
+                String pName = sKnownPlugins.get(pId);
+                return pName != null ? "Plugin: " + pName + " (" + pId + ")" : "Plugin: " + pId;
             }
             if (cls.startsWith("plugins.")) {
                 String[] parts = cls.split("\\.");
-                return parts.length >= 2 ? "Plugin: " + parts[1] : "Plugin: " + cls;
+                String pId = parts.length >= 2 ? parts[1] : cls;
+                String pName = sKnownPlugins.get(pId);
+                return pName != null ? "Plugin: " + pName + " (" + pId + ")" : "Plugin: " + pId;
             }
             if (cls.startsWith("com.exteragram.plugins.")) {
                 String[] parts = cls.split("\\.");
-                return parts.length >= 4 ? "Plugin: " + parts[3] : "Plugin: " + cls;
+                String pId = parts.length >= 4 ? parts[3] : cls;
+                String pName = sKnownPlugins.get(pId);
+                return pName != null ? "Plugin: " + pName + " (" + pId + ")" : "Plugin: " + pId;
             }
             String file = elem.getFileName();
             if (file != null && file.endsWith(".py")) {
@@ -215,7 +270,9 @@ public class Main {
                 if (base.contains("/")) base = base.substring(base.lastIndexOf('/') + 1);
                 if (base.contains("\\")) base = base.substring(base.lastIndexOf('\\') + 1);
                 if (!base.equals("python.py") && !base.equals("base_plugin.py")) {
-                    return "Python: " + (base.endsWith(".py") ? base.substring(0, base.length() - 3) : base);
+                    String pId = base.endsWith(".py") ? base.substring(0, base.length() - 3) : base;
+                    String pName = sKnownPlugins.get(pId);
+                    return pName != null ? "Python: " + pName + " (" + pId + ")" : "Python: " + pId;
                 }
             }
             if (cls.contains("chaquo") || cls.contains("python")) {
@@ -290,8 +347,8 @@ public class Main {
                         if (target == null) return;
                         StackTraceElement[] stack = Thread.currentThread().getStackTrace();
                         String culprit = detectCulprit(stack);
-                        if (culprit != null && culprit.startsWith("Plugin: ")) {
-                            sThreadOwners.put(target.getId(), culprit.substring(8));
+                        if (culprit != null && (culprit.startsWith("Plugin: ") || culprit.startsWith("Python: "))) {
+                            sThreadOwners.put(target.getId(), culprit);
                         }
                     } catch (Throwable ignored) {
                     }
@@ -303,39 +360,82 @@ public class Main {
         }
     }
 
+    private static void initEventNamesMap(Class<?> ncClass) {
+        try {
+            for (Field f : ncClass.getDeclaredFields()) {
+                if (f.getType() == int.class && java.lang.reflect.Modifier.isStatic(f.getModifiers())) {
+                    try {
+                        f.setAccessible(true);
+                        int id = f.getInt(null);
+                        sEventNames.put(id, f.getName());
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+            Log.d(TAG, "Loaded " + sEventNames.size() + " NotificationCenter event names");
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed to load event names", t);
+        }
+    }
+
     private static void hookNotificationCenter() {
         try {
             Class<?> ncClass = Class.forName("org.telegram.messenger.NotificationCenter");
+            initEventNamesMap(ncClass);
+
             for (Method m : ncClass.getDeclaredMethods()) {
                 String name = m.getName();
-                if ("addObserver".equals(name)) {
+                Class<?>[] pTypes = m.getParameterTypes();
+                if ("addObserver".equals(name) && pTypes.length >= 2 && pTypes[1] == int.class) {
                     XposedBridge.hookMethod(m, new XC_MethodHook() {
                         @Override
                         public void afterHookedMethod(MethodHookParam param) {
                             try {
                                 StackTraceElement[] stack = Thread.currentThread().getStackTrace();
                                 String culprit = detectCulprit(stack);
-                                if (culprit != null && culprit.startsWith("Plugin: ")) {
-                                    String plugin = culprit.substring(8);
-                                    Integer cur = sObserverCounts.get(plugin);
-                                    sObserverCounts.put(plugin, cur == null ? 1 : cur + 1);
+                                if (culprit != null && (culprit.startsWith("Plugin: ") || culprit.startsWith("Python: "))) {
+                                    int eventId = (Integer) param.args[1];
+                                    String eventName = sEventNames.get(eventId);
+                                    if (eventName == null) eventName = "Event#" + eventId;
+
+                                    Integer cur = sObserverCounts.get(culprit);
+                                    sObserverCounts.put(culprit, cur == null ? 1 : cur + 1);
+
+                                    Map<String, Integer> details = sPluginObserverDetails.get(culprit);
+                                    if (details == null) {
+                                        details = new ConcurrentHashMap<String, Integer>();
+                                        sPluginObserverDetails.put(culprit, details);
+                                    }
+                                    Integer eCur = details.get(eventName);
+                                    details.put(eventName, eCur == null ? 1 : eCur + 1);
                                 }
                             } catch (Throwable ignored) {
                             }
                         }
                     });
-                } else if ("removeObserver".equals(name)) {
+                } else if ("removeObserver".equals(name) && pTypes.length >= 2 && pTypes[1] == int.class) {
                     XposedBridge.hookMethod(m, new XC_MethodHook() {
                         @Override
                         public void afterHookedMethod(MethodHookParam param) {
                             try {
                                 StackTraceElement[] stack = Thread.currentThread().getStackTrace();
                                 String culprit = detectCulprit(stack);
-                                if (culprit != null && culprit.startsWith("Plugin: ")) {
-                                    String plugin = culprit.substring(8);
-                                    Integer cur = sObserverCounts.get(plugin);
+                                if (culprit != null && (culprit.startsWith("Plugin: ") || culprit.startsWith("Python: "))) {
+                                    int eventId = (Integer) param.args[1];
+                                    String eventName = sEventNames.get(eventId);
+                                    if (eventName == null) eventName = "Event#" + eventId;
+
+                                    Integer cur = sObserverCounts.get(culprit);
                                     if (cur != null && cur > 0) {
-                                        sObserverCounts.put(plugin, cur - 1);
+                                        sObserverCounts.put(culprit, cur - 1);
+                                    }
+
+                                    Map<String, Integer> details = sPluginObserverDetails.get(culprit);
+                                    if (details != null) {
+                                        Integer eCur = details.get(eventName);
+                                        if (eCur != null && eCur > 0) {
+                                            details.put(eventName, eCur - 1);
+                                        }
                                     }
                                 }
                             } catch (Throwable ignored) {
@@ -344,9 +444,102 @@ public class Main {
                     });
                 }
             }
-            Log.d(TAG, "Hooked NotificationCenter observers");
+            Log.d(TAG, "Hooked NotificationCenter observers with event details");
         } catch (Throwable t) {
             Log.e(TAG, "Failed to hook NotificationCenter", t);
+        }
+    }
+
+    private static void hookConnectionsManager() {
+        try {
+            Class<?> cmClass = Class.forName("org.telegram.tgnet.ConnectionsManager");
+            for (Method m : cmClass.getDeclaredMethods()) {
+                if (m.getName().startsWith("sendRequest") && m.getParameterTypes().length > 0) {
+                    XposedBridge.hookMethod(m, new XC_MethodHook() {
+                        @Override
+                        public void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                StackTraceElement[] stack = Thread.currentThread().getStackTrace();
+                                String culprit = detectCulprit(stack);
+                                if (culprit != null && (culprit.startsWith("Plugin: ") || culprit.startsWith("Python: "))) {
+                                    Object tlObj = param.args[0];
+                                    String reqType = tlObj != null ? tlObj.getClass().getSimpleName() : "TLObject";
+
+                                    NetworkPluginStats stats = sNetworkStats.get(culprit);
+                                    if (stats == null) {
+                                        stats = new NetworkPluginStats();
+                                        sNetworkStats.put(culprit, stats);
+                                    }
+                                    long now = System.currentTimeMillis();
+                                    synchronized (stats) {
+                                        stats.totalRequests++;
+                                        stats.lastRequestType = reqType;
+                                        stats.lastRequestTime = now;
+                                        stats.requestTimestamps.add(now);
+
+                                        // Prune timestamps older than 60s
+                                        Iterator<Long> it = stats.requestTimestamps.iterator();
+                                        while (it.hasNext()) {
+                                            if (now - it.next() > 60000) {
+                                                it.remove();
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    });
+                }
+            }
+            Log.d(TAG, "Hooked ConnectionsManager.sendRequest for network attribution");
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed to hook ConnectionsManager.sendRequest", t);
+        }
+    }
+
+    private static void hookRunOnUIThread() {
+        try {
+            Class<?> auClass = Class.forName("org.telegram.messenger.AndroidUtilities");
+            for (Method m : auClass.getDeclaredMethods()) {
+                if ("runOnUIThread".equals(m.getName()) && m.getParameterTypes().length > 0 && m.getParameterTypes()[0] == Runnable.class) {
+                    XposedBridge.hookMethod(m, new XC_MethodHook() {
+                        @Override
+                        public void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                final Runnable original = (Runnable) param.args[0];
+                                if (original == null) return;
+                                StackTraceElement[] stack = Thread.currentThread().getStackTrace();
+                                final String culprit = detectCulprit(stack);
+                                if (culprit != null && (culprit.startsWith("Plugin: ") || culprit.startsWith("Python: "))) {
+                                    param.args[0] = new Runnable() {
+                                        @Override
+                                        public void run() {
+                                            long t0 = System.currentTimeMillis();
+                                            try {
+                                                original.run();
+                                            } finally {
+                                                long el = System.currentTimeMillis() - t0;
+                                                if (el >= 80) {
+                                                    String top = original.getClass().getName();
+                                                    addLagRecord(new LagRecord(t0, el, culprit, top, "AndroidUtilities.runOnUIThread stall (" + el + " ms)\n" + top));
+                                                    Log.w(TAG, "runOnUIThread task stall: " + el + "ms from " + culprit);
+                                                }
+                                            }
+                                        }
+                                    };
+                                }
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    });
+                }
+            }
+            Log.d(TAG, "Hooked AndroidUtilities.runOnUIThread for task stall attribution");
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed to hook AndroidUtilities.runOnUIThread", t);
         }
     }
 
@@ -447,9 +640,12 @@ public class Main {
         }
         sInitialized = true;
 
+        updateKnownPlugins();
         hookBaseFragment();
         hookThreadStart();
         hookNotificationCenter();
+        hookConnectionsManager();
+        hookRunOnUIThread();
         installUncaughtExceptionHandler();
         startWatchdog();
 
@@ -460,7 +656,7 @@ public class Main {
         } catch (Throwable ignored) {
         }
 
-        Log.i(TAG, "MaxTrace Java-layer loaded: trackScreens=" + sTrackScreens + ", trackLags=" + sTrackLags);
+        Log.i(TAG, "MaxTrace Full-Upgrade Java-layer loaded: screens=" + sTrackScreens + ", lags=" + sTrackLags);
     }
 
     public static synchronized void pyUpdateSettings(boolean trackScreens, boolean trackLags, int lagThresholdMs) {
@@ -504,6 +700,54 @@ public class Main {
             if (!first) sb.append(",");
             first = false;
             sb.append("\"").append(escapeJson(entry.getKey())).append("\":").append(entry.getValue());
+        }
+        sb.append("}");
+        return sb.toString();
+    }
+
+    public static String pyGetNotificationDetailsJson() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("{");
+        boolean firstP = true;
+        for (Map.Entry<String, Map<String, Integer>> pEntry : sPluginObserverDetails.entrySet()) {
+            if (!firstP) sb.append(",");
+            firstP = false;
+            sb.append("\"").append(escapeJson(pEntry.getKey())).append("\":{");
+            boolean firstE = true;
+            for (Map.Entry<String, Integer> eEntry : pEntry.getValue().entrySet()) {
+                if (eEntry.getValue() > 0) {
+                    if (!firstE) sb.append(",");
+                    firstE = false;
+                    sb.append("\"").append(escapeJson(eEntry.getKey())).append("\":").append(eEntry.getValue());
+                }
+            }
+            sb.append("}");
+        }
+        sb.append("}");
+        return sb.toString();
+    }
+
+    public static String pyGetNetworkStatsJson() {
+        long now = System.currentTimeMillis();
+        StringBuilder sb = new StringBuilder();
+        sb.append("{");
+        boolean first = true;
+        for (Map.Entry<String, NetworkPluginStats> entry : sNetworkStats.entrySet()) {
+            if (!first) sb.append(",");
+            first = false;
+            NetworkPluginStats stats = entry.getValue();
+            int reqLastMin = 0;
+            synchronized (stats) {
+                for (Long t : stats.requestTimestamps) {
+                    if (now - t <= 60000) reqLastMin++;
+                }
+                sb.append("\"").append(escapeJson(entry.getKey())).append("\":{");
+                sb.append("\"total\":").append(stats.totalRequests).append(",");
+                sb.append("\"lastMinute\":").append(reqLastMin).append(",");
+                sb.append("\"lastType\":\"").append(escapeJson(stats.lastRequestType)).append("\",");
+                sb.append("\"lastTime\":").append(stats.lastRequestTime);
+                sb.append("}");
+            }
         }
         sb.append("}");
         return sb.toString();
@@ -660,6 +904,7 @@ public class Main {
         sb.append("\"leaksCount\":").append(leaksCount).append(",");
         sb.append("\"lagsCount\":").append(lagsCount).append(",");
         sb.append("\"crashesCount\":").append(crashesCount).append(",");
+        sb.append("\"networkTrackedPlugins\":").append(sNetworkStats.size()).append(",");
         sb.append("\"trackedScreensCount\":").append(sTrackedFragments.size()).append(",");
         sb.append("\"trackedThreadsCount\":").append(sThreadOwners.size());
         sb.append("}");
