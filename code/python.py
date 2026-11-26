@@ -69,6 +69,10 @@ class DexBridge:
 
     def _extract_payload(self) -> bytes:
         try:
+            _dex_b64 = globals().get("_DEX_PAYLOAD")
+            if _dex_b64:
+                import base64, zlib
+                return zlib.decompress(base64.b64decode(_dex_b64))
             with open(__file__, "r", encoding="utf-8") as f:
                 content = f.read()
             m_begin = "# " + "__DEX_BEGIN__"
